@@ -778,6 +778,7 @@ struct Options {
     std::vector<std::pair<std::string, float>> cvec_files;
     int cvec_first = -1, cvec_last = -1;   ///< llama.cpp's defaults: 1 .. the last layer
     int cvec_mode = 1;                     ///< 0 = project, 1 = add (llama.cpp's default)
+    int cvec_place = 0;                    ///< 0 = residual (after the FFN write), 1 = block (each half's output; project only)
     int cvec_single = -1;                  ///< --cvec-dir single:L (project mode): layer L's direction everywhere
 };
 
@@ -929,6 +930,9 @@ void usage() {
                  "  --control-vector-layer-range A B  the layers it follows (inclusive; default 1 .. the last)\n"
                  "  --cvec-mode add|project  h += s v (default) or h -= s (h.v) v with v unit\n"
                  "  --cvec-dir per-layer|single:L  each layer's own direction (default) or layer L's everywhere (project)\n"
+                 "  --cvec-place residual|block  where it applies: the residual streams after the layer's FFN write\n"
+                 "                       (default) or each half's output (attention, FFN) before its write - the weight\n"
+                 "                       edit W' = W - s v v^T W of an abliteration, at run time (project only)\n"
                  "  --no-token-graph     A/B: two graphs per layer (the host launches each) instead of one per token\n"
                  "  --no-fused-gr        A/B: the six-kernel hyper-connection read and a separate write (native)\n"
                  "  --prefill CHUNK      batched prompt processing in chunks of CHUNK tokens (needs --native); auto =\n"
@@ -1847,6 +1851,7 @@ bool load_control_vectors(const Options& o, const strata::core::ModelGeometry& g
             return false;
         }
     }
+    if (o.cvec_place == 1 && o.cvec_mode != 0) { err = "--cvec-place block needs --cvec-mode project"; return false; }
     const int first = o.cvec_first <= 0 ? 1 : o.cvec_first;
     const int last = (o.cvec_last <= 0 || o.cvec_last >= L) ? (int) L - 1 : o.cvec_last;
     const int single = o.cvec_mode == 0 ? o.cvec_single : -1;
@@ -1874,10 +1879,11 @@ bool load_control_vectors(const Options& o, const strata::core::ModelGeometry& g
         ++steered;
     }
     if (steered == 0) { err = "the control vector has no direction in layers " + std::to_string(first) + ".." + std::to_string(last); return false; }
-    if (!strata::kernels::cvec_upload(dir, s, o.cvec_mode, first, last, N, g.hc, err)) return false;
+    if (!strata::kernels::cvec_upload(dir, s, o.cvec_mode, o.cvec_place, first, last, N, g.hc, err)) return false;
     {
         strata::core::SessionIdentityBuilder b(0x43564543ull);   // "CVEC"
         b.i64("mode", o.cvec_mode);
+        b.i64("place", o.cvec_place);
         b.i64("first", first);
         b.i64("last", last);
         b.i64("single", single);
@@ -1887,10 +1893,11 @@ bool load_control_vectors(const Options& o, const strata::core::ModelGeometry& g
         if (digest == 0) digest = 1;   // 0 means "none loaded"
     }
     summary = std::string(o.cvec_mode == 0 ? "project" : "add") + ":" + std::to_string(first) + "-" + std::to_string(last) +
-              (single >= 0 ? ":single" + std::to_string(single) : "");
+              (single >= 0 ? ":single" + std::to_string(single) : "") + (o.cvec_place == 1 ? ":block" : "");
     // the line llama.cpp's patched build prints, so a log shows the same thing
-    std::fprintf(stderr, "strata generate: control vector mode = %s, dir = %s, layers %d..%d (%d steered)\n",
-                 o.cvec_mode == 0 ? "project" : "add", single >= 0 ? "single" : "per-layer", first, last, steered);
+    std::fprintf(stderr, "strata generate: control vector mode = %s, dir = %s, place = %s, layers %d..%d (%d steered)\n",
+                 o.cvec_mode == 0 ? "project" : "add", single >= 0 ? "single" : "per-layer",
+                 o.cvec_place == 1 ? "block" : "residual", first, last, steered);
     return true;
 }
 
@@ -2575,6 +2582,12 @@ int main(int argc, char** argv) {
             if (d == "per-layer") o.cvec_single = -1;
             else if (d.rfind("single:", 0) == 0) o.cvec_single = std::atoi(d.c_str() + 7);
             else { std::fprintf(stderr, "--cvec-dir: per-layer or single:L, got '%s'\n", d.c_str()); return 2; }
+        }
+        else if (a == "--cvec-place") {
+            const std::string p = next("--cvec-place");
+            if (p == "residual") o.cvec_place = 0;
+            else if (p == "block") o.cvec_place = 1;
+            else { std::fprintf(stderr, "--cvec-place: residual or block, got '%s'\n", p.c_str()); return 2; }
         }
         else if (a == "--no-spec-split") o.spec_split = false;
         else if (a == "--eos-ids") {

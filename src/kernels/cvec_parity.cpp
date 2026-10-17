@@ -4,6 +4,8 @@
 //   3. switched off: R unchanged without a pending write; with one, R is BITWISE the write the fused read folds
 //      (fused_gr_read with apply), which is what keeps a loaded-but-off vector identical to the stock engine.
 //   4. a layer without a direction is untouched.
+//   5. place = block: bo - s (bo.v) v on n_embd-wide half outputs, against double precision; the residual sites
+//      (`covers`) are off and the half sites (`block`) on; switched off, bo is unchanged.
 
 #include "strata/kernels/cvec.hpp"
 #include "strata/kernels/fused_gr.hpp"
@@ -70,8 +72,9 @@ int main() {
         s[(size_t) kLayer] = 2.0f;
     }
     std::string err;
-    if (!k::cvec_upload(dir, s, /*project*/ 0, 4, 44, N, HC, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 2; }
+    if (!k::cvec_upload(dir, s, /*project*/ 0, /*residual*/ 0, 4, 44, N, HC, err)) { std::fprintf(stderr, "%s\n", err.c_str()); return 2; }
     check(k::cvec().covers(kLayer) && !k::cvec().covers(kOff) && !k::cvec().covers(45), "covers(): steered layers only");
+    check(!k::cvec().block(kLayer), "block(): off at place = residual");
 
     std::vector<float> R((size_t) (T * D)), bo((size_t) (T * N)), inj((size_t) (T * HC));
     for (auto& x : R) x = nd(rng) * 3.0f;
@@ -113,7 +116,7 @@ int main() {
     }
     // s = 1 removes it
     s[(size_t) kLayer] = 1.0f;
-    if (!k::cvec_upload(dir, s, 0, 4, 44, N, HC, err)) return 2;
+    if (!k::cvec_upload(dir, s, 0, 0, 4, 44, N, HC, err)) return 2;
     up(dR, R);
     k::cvec_apply(dR, kLayer, T, D, nullptr, 0, nullptr, 0, false, nullptr);
     ck(cudaDeviceSynchronize(), "project s=1");
@@ -198,11 +201,58 @@ int main() {
         check(worst < 1e-4, "on, pending write: the write, then the projection");
     }
 
+    // ---- 5. place = block: the half outputs, s = 2 reflects the component
+    std::printf("block\n");
+    s[(size_t) kLayer] = 2.0f;
+    if (!k::cvec_upload(dir, s, /*project*/ 0, /*block*/ 1, 4, 44, N, HC, err)) return 2;
+    check(k::cvec().block(kLayer) && !k::cvec().block(kOff) && !k::cvec().block(45), "block(): steered layers only");
+    check(!k::cvec().covers(kLayer), "covers(): off at place = block (the residual sites stay stock)");
+    {
+        float* dbo2 = dalloc<float>(bo.size());
+        up(dbo2, bo);
+        k::cvec_apply_block(dbo2, kLayer, T, N, nullptr);
+        ck(cudaDeviceSynchronize(), "block");
+        const auto got = down(dbo2, bo.size());
+        double worst = 0.0, worst_dot = 0.0;
+        for (int64_t t = 0; t < T; ++t) {
+            const float* h = bo.data() + t * N;
+            const float* v = dir.data() + kLayer * N;
+            double dot = 0.0;
+            for (int64_t j = 0; j < N; ++j) dot += (double) h[j] * v[j];
+            double after = 0.0;
+            for (int64_t j = 0; j < N; ++j) {
+                const double want = h[j] - 2.0 * dot * v[j];
+                const double gv = got[(size_t) (t * N + j)];
+                worst = std::fmax(worst, std::fabs(gv - want));
+                after += gv * v[j];
+            }
+            worst_dot = std::fmax(worst_dot, std::fabs(after + dot));
+        }
+        std::printf("    max |err| %.3g, max |bo'.v + bo.v| %.3g\n", worst, worst_dot);
+        check(worst < 1e-4, "block matches bo - s (bo.v) v on every half output (s = 2)");
+        check(worst_dot < 1e-3, "the component along v is reflected (s = 2)");
+        up(dbo2, bo);
+        k::cvec_apply_block(dbo2, kOff, T, N, nullptr);
+        ck(cudaDeviceSynchronize(), "block off layer");
+        check(std::memcmp(down(dbo2, bo.size()).data(), bo.data(), bo.size() * 4) == 0, "block: a layer without a direction is untouched");
+        k::cvec_set_enabled(false);
+        up(dbo2, bo);
+        k::cvec_apply_block(dbo2, kLayer, T, N, nullptr);
+        ck(cudaDeviceSynchronize(), "block off");
+        check(std::memcmp(down(dbo2, bo.size()).data(), bo.data(), bo.size() * 4) == 0, "block: switched off, bo unchanged");
+        k::cvec_set_enabled(true);
+        cudaFree(dbo2);
+    }
+    {
+        std::string e2;
+        check(!k::cvec_upload(dir, s, /*add*/ 1, /*block*/ 1, 4, 44, N, HC, e2), "block with add mode is refused at upload");
+    }
+
     // ---- 2. add
     std::printf("add\n");
     for (int64_t j = 0; j < N; ++j) dir[(size_t) (kLayer * N + j)] *= 0.1f;   // d = 0.1 v, s = 1
     s[(size_t) kLayer] = 1.0f;
-    if (!k::cvec_upload(dir, s, /*add*/ 1, 4, 44, N, HC, err)) return 2;
+    if (!k::cvec_upload(dir, s, /*add*/ 1, /*residual*/ 0, 4, 44, N, HC, err)) return 2;
     up(dR, R);
     k::cvec_apply(dR, kLayer, T, D, nullptr, 0, nullptr, 0, false, nullptr);
     ck(cudaDeviceSynchronize(), "add");

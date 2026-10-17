@@ -2027,8 +2027,18 @@ Qwen3.8-Flash-Next, not Swift 1.5. It writes these engine flags (llama.cpp's) in
 --control-vector-layer-range 4 44 --cvec-mode project --cvec-dir per-layer
 ```
 
-The engine log then says `control vector mode = project, dir = per-layer, layers 4..44 (41 steered)`, and the web
-app's About tab lists it. (`--cvec-mode add` is llama.cpp's stock additive mode, for additive vectors.)
+The engine log then says `control vector mode = project, dir = per-layer, place = residual, layers 4..44 (41 steered)`,
+and the web app's About tab lists it. (`--cvec-mode add` is llama.cpp's stock additive mode, for additive vectors.)
+
+**Where it applies: `--cvec-place residual|block`.** By default (`residual`) the projection runs on the residual
+streams after each steered layer's FFN write, as above. `--cvec-place block` (project mode only) runs it instead on
+each half's output - the attention (or GDN) output and the FFN output of the layer, before their hyper-connection
+writes - and leaves the residual alone. That is the runtime form of an abliteration's weight edit,
+`W' = W - s v v^T W` on every matrix that writes into the residual: the projection commutes past the matmul, so the
+quantized weights are untouched. The two places agree at scale 1 (the component is removed either way) and differ
+above it: a vector tuned as a reflection of the writers (scale 1.75-2, e.g. a direction recovered from a published
+abliterated checkpoint) wants `block`; reflecting the whole residual at every layer is a different operation.
+Same vector files, same per-request switch; the log line and the About tab say `place = block`.
 
 **Per request.** A loaded vector is on for every request unless it says otherwise: the web app's Sampling drawer has
 a switch, and the API takes `"experimental_speed_projection": false` in the request body (OpenAI and Anthropic; a

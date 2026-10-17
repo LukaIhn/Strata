@@ -1182,6 +1182,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
                 return e != nullptr && std::atoi(e) != 0;
             }();
             const bool ple_post = ple_batch_kv && ple_post_env && !batch_rec_;
+            // --cvec-place block: the mixer's output rows, before their writes
+            if (cvec().block(l)) cvec_apply_block(bo_ + tb * N, l, n, N, cs);
             // #783 PR-g (stuchapin909): the window's residual writes in one launch (STRATA_NO_MULTI_GR=1: per token)
             const bool multi_write = !ple_post && dec_batch && !g_no_multi_gr && n > 1;
             if (multi_write) gr_write_multi(Rt(tb), bo_ + tb * N, inj2_ + tb * HC, gs, Rt(tb), n, cs);
@@ -2065,6 +2067,8 @@ bool Verifier::record_window(int T, cudaStream_t cs, std::string& err) {
             mb.weights = w_ + t * K; mb.shared = shared_ + t * N;
             if (!moe_combine_parts(g, l, K, mb, parts_ + (size_t) t * K * N, bo_ + t * N, cs, err)) return false;
         }
+        // --cvec-place block: the FFN's output rows, before their writes
+        if (cvec().block(l)) cvec_apply_block(bo_ + tb * N, l, n, N, cs);
         if (remote_opt_) remote_opt_->combine(bo_ + tb * N, y_dummy_ + tb * N, tb, n,
                               device_plan_ ? skip_ + grp : nullptr, ring, cs);
         stamp(l, 24, grp);

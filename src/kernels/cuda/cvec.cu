@@ -98,9 +98,10 @@ __global__ void cvec_kernel(float* __restrict__ R, const float* __restrict__ dir
 
 const Cvec& cvec() { return g_cvec; }
 
-bool cvec_upload(const std::vector<float>& dir, const std::vector<float>& s, int mode, int first, int last,
+bool cvec_upload(const std::vector<float>& dir, const std::vector<float>& s, int mode, int place, int first, int last,
                  int64_t n_embd, int64_t hc, std::string& err) {
     if (n_embd < 1 || n_embd > (int64_t) THREADS * MAXK) { err = "control vector: unsupported n_embd"; return false; }
+    if (place == 1 && mode != 0) { err = "control vector: --cvec-place block needs --cvec-mode project"; return false; }
     if (s.empty() || dir.size() != s.size() * (size_t) n_embd) { err = "control vector: bad table sizes"; return false; }
     int prev = 0;   // a new vector replaces the old one on every device
     cudaGetDevice(&prev);
@@ -123,6 +124,7 @@ bool cvec_upload(const std::vector<float>& dir, const std::vector<float>& s, int
     g_cvec.s = t.s;
     g_cvec.on = t.on;
     g_cvec.mode = mode;
+    g_cvec.place = place;
     g_cvec.first = first;
     g_cvec.last = last;
     g_cvec.n_embd = n_embd;
@@ -169,6 +171,18 @@ void cvec_apply(float* R, int64_t layer, int64_t T, int64_t r_ld, const float* b
                                                             (int) g_cvec.n_embd, (int) g_cvec.hc, r_ld, bo, bo_ld,
                                                             inj, inj_ld, write ? 1 : 0);
     if (cudaPeekAtLastError() != cudaSuccess) throw std::runtime_error("cvec_apply: launch failed");
+}
+
+void cvec_apply_block(float* bo, int64_t layer, int64_t T, int64_t bo_ld, void* stream) {
+    if (!g_cvec.loaded() || T < 1) return;
+    if (g_cvec.mode != 0) throw std::runtime_error("cvec_apply_block: project mode only");
+    const DevTables& t = g_dev[cur_device()];
+    if (t.dir == nullptr) throw std::runtime_error("cvec_apply_block: the control vector is not on this device (cvec_replicate)");
+    // one n_embd-wide row per token: the residual kernel with a single "stream" and no pending write
+    const dim3 grid(1u, (unsigned) T);
+    cvec_kernel<<<grid, THREADS, 0, (cudaStream_t) stream>>>(bo, t.dir, t.s, t.on, g_cvec.mode, layer,
+                                                            (int) g_cvec.n_embd, 1, bo_ld, nullptr, 0, nullptr, 0, 0);
+    if (cudaPeekAtLastError() != cudaSuccess) throw std::runtime_error("cvec_apply_block: launch failed");
 }
 
 }  // namespace strata::kernels

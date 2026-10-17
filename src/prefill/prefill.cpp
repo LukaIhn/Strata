@@ -4503,6 +4503,8 @@ bool Prefill::run_impl(const int64_t* tokens, int64_t n, int64_t pos0, std::stri
                         }
                     }
                 }
+                // --cvec-place block: this half's output, before its write (either half; the residual is left alone)
+                if (strata::kernels::cvec().block(l)) strata::kernels::cvec_apply_block(m.bo, l, T, N, m.cs);
                 // ---- the hyper-connection write of this half; F-2: fused with the next half's norm when nothing else
                 // touches R in between (not the stage's last half, not before the PLE block of layer 1, not under a
                 // control vector)

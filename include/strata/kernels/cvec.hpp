@@ -8,7 +8,15 @@
 //   project:  h <- h - s_l (h . v_l) v_l        v_l = d / |d|, s_l = |d|, d = the scaled direction
 //   add:      h <- h + d                        llama.cpp's stock additive control vector
 //
-// for l in [first, last].  `d` is the GGUF's `direction.<src>` times the file's scale (summed over files), with
+// for l in [first, last].  That is `--cvec-place residual`.  `--cvec-place block` (project only) applies the same
+// projection to each half's OUTPUT instead - the attention (or GDN) output and the FFN output of layer l, n_embd
+// wide, before its hyper-connection write - and leaves the residual streams alone.  That is the runtime form of
+// the weight edit W' = W - s v v^T W on every matrix that writes into the residual (an abliteration): the
+// projection commutes past the matmul, so the quantized weights stay as they are.  The two places agree at s = 1
+// (the component is gone either way); they differ for s != 1, where a reflection (s = 2) of the full residual
+// at every layer is not the reflection of each writer's contribution.
+//
+// `d` is the GGUF's `direction.<src>` times the file's scale (summed over files), with
 // src = l (per-layer) or one fixed layer (single:L, project mode only), exactly as llama.cpp's loader places it;
 // layer 0 has no direction.  Off unless a vector is loaded (--control-vector-scaled); a loaded one is switched
 // per request through a device flag, so the captured graphs are the same either way.  With the flag off the
@@ -27,20 +35,27 @@ struct Cvec {
     const float* s = nullptr;     ///< device, n_layers: project = s_l, add = 1; 0 = the layer is not steered
     const int* on = nullptr;      ///< device int: 0 = this request runs the stock model
     int mode = 0;                 ///< 0 = project, 1 = add
+    int place = 0;                ///< 0 = residual (after layer l's FFN write), 1 = block (each half's output, before its write)
     int first = 0, last = -1;     ///< the steered layers, inclusive
     int64_t n_embd = 0, hc = 0;
     bool loaded() const { return dir != nullptr; }
     /// Layer l's FFN write is followed by the vector (with a real direction there).  Decided at load time, never
     /// per request: it changes where the residual write happens, so the graphs depend on it.
-    bool covers(int64_t l) const { return loaded() && l >= first && l <= last && l < (int64_t) steered.size() && steered[(size_t) l]; }
+    bool covers(int64_t l) const { return place == 0 && in_range(l); }
+    /// `--cvec-place block`: layer l's two half outputs are projected before their writes (`cvec_apply_block`).
+    bool block(int64_t l) const { return place == 1 && in_range(l); }
     std::vector<bool> steered;    ///< host copy of s_l != 0
+
+  private:
+    bool in_range(int64_t l) const { return loaded() && l >= first && l <= last && l < (int64_t) steered.size() && steered[(size_t) l]; }
 };
 
 /// The loaded vector (empty until `cvec_upload`).
 const Cvec& cvec();
 
 /// Upload a vector built by the loader: `dir` is n_layers * n_embd, `s` n_layers (see `Cvec`).  Starts ON.
-bool cvec_upload(const std::vector<float>& dir, const std::vector<float>& s, int mode, int first, int last,
+/// `place` 1 (block) needs `mode` 0 (project).
+bool cvec_upload(const std::vector<float>& dir, const std::vector<float>& s, int mode, int place, int first, int last,
                  int64_t n_embd, int64_t hc, std::string& err);
 
 /// A layer split: put the loaded vector's tables on the CURRENT device too (cvec_apply uses the tables of the device
@@ -61,5 +76,10 @@ bool cvec_tables(const float** dir, const float** s, const int** on);
 /// whose writes are folded into the next layer's read; without it, R must already hold the layer's output.
 void cvec_apply(float* R, int64_t layer, int64_t T, int64_t r_ld, const float* bo, int64_t bo_ld, const float* inj,
                 int64_t inj_ld, bool write, void* stream);
+
+/// `--cvec-place block`: layer `layer`'s projection on T half outputs (`bo + t * bo_ld`, n_embd each), in place:
+/// bo <- bo - s_l (bo . v_l) v_l.  Call it on the attention (GDN) output and on the FFN output before their
+/// hyper-connection writes.  Honours the per-request switch like `cvec_apply`; a no-op without a vector.
+void cvec_apply_block(float* bo, int64_t layer, int64_t T, int64_t bo_ld, void* stream);
 
 }  // namespace strata::kernels
