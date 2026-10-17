@@ -179,6 +179,63 @@ class MaxTokens(unittest.TestCase):
             del os.environ["STRATA_DEBUG"]
 
 
+class SamplingRecorder(MockEngine):
+    def generate(self, ids, max_new, sampling, cancel, embeddings=None):
+        self.last_sampling = dict(sampling or {})
+        yield from super().generate(ids, max_new, sampling, cancel, embeddings)
+
+
+class AliasSampling(unittest.TestCase):
+    """`alias_sampling`: the model name a request asks for picks sampling defaults (its own fields still win)."""
+
+    @classmethod
+    def setUpClass(cls):
+        tok = ByteTokenizer()
+        cls.engine = SamplingRecorder(tok, "</think>\n\n" + ANSWER, max_context=CTX)
+        cls.svc = Service(cls.engine, tok, ChatTemplate(ROOT / "serve/chat_template.jinja"), model_name="m")
+        cls.svc.set_alias_sampling({"m-stock": {"experimental_speed_projection": False, "temperature": 0.3}})
+        cls.httpd = serve(cls.svc, port=0)
+        cls.base = f"http://127.0.0.1:{cls.httpd.server_address[1]}"
+
+    @classmethod
+    def tearDownClass(cls):
+        cls.httpd.shutdown()
+        cls.httpd.server_close()
+
+    def post(self, body):
+        req = urllib.request.Request(self.base + "/v1/messages", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req) as r:
+            return json.loads(r.read())
+
+    def test_the_name_is_an_alias(self):
+        self.assertIn("m-stock", self.svc.aliases)
+        self.assertEqual(self.svc.model_for({"model": "m-stock"}), "m-stock")
+
+    def test_the_alias_sets_its_defaults(self):
+        out = self.post({"model": "m-stock", "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]})
+        self.assertEqual(out["model"], "m-stock")
+        self.assertIs(self.engine.last_sampling.get("experimental_speed_projection"), False)
+        self.assertEqual(self.engine.last_sampling.get("temperature"), 0.3)
+
+    def test_the_model_name_itself_gets_none_of_them(self):
+        self.post({"model": "m", "max_tokens": 8, "messages": [{"role": "user", "content": "hi"}]})
+        self.assertNotIn("experimental_speed_projection", self.engine.last_sampling)
+
+    def test_the_requests_own_field_wins(self):
+        self.post({"model": "m-stock", "max_tokens": 8, "experimental_speed_projection": True,
+                   "messages": [{"role": "user", "content": "hi"}]})
+        self.assertIs(self.engine.last_sampling.get("experimental_speed_projection"), True)
+
+    def test_a_bad_block_is_refused(self):
+        with self.assertRaises(ValueError):
+            self.svc.set_alias_sampling({"m": {"temperature": 0.5}})          # the model's own name
+        with self.assertRaises(ValueError):
+            self.svc.set_alias_sampling({"x": [1]})                            # not a dict of fields
+        with self.assertRaises(SystemExit):
+            self.svc.set_alias_sampling({"x": {"experimental_speed_projection": "yes"}})   # a bad value, as in `sampling`
+
+
 class FitMaxTokens(unittest.TestCase):
     """PR #24: --fit-max-tokens clamps an explicit budget that overshoots the context instead of a 400."""
 
