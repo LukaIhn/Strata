@@ -3110,6 +3110,7 @@ class Service:
         self.literals = literal_tags(getattr(tokenizer, "control_tokens", ()))   # texts that stay text inside a message
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
+        self.alias_sampling: dict[str, dict] = {}     # the config's `alias_sampling`: sampling defaults per model name
         self.answer_room = True                       # 0.1.45: see ANSWER_ROOM_MIN_CAP (the config's "answer_room": false turns it off)
         self.reasoning_close_retry = False            # #1053 (opt-in): close the thinking once when a reply ends inside it
         self.codex_compaction_cache = False           # #924 (opt-in): a Codex compaction is rendered with its conversation's tools
@@ -3285,6 +3286,25 @@ class Service:
             if x and x != self.model and x not in names:
                 names.append(x)
         self.aliases = names
+
+    def set_alias_sampling(self, block) -> None:
+        """The config's `alias_sampling`: {model name: sampling defaults}, the same keys as the `sampling` block.  A
+        request that asks for that model name gets those defaults (its own fields still win), so a client that cannot
+        set a field itself - Claude Code, Codex - picks a configuration by the model name it sends, e.g.
+        {"qwen3.8-flash-next-stock": {"experimental_speed_projection": false}} beside a loaded control vector.
+        Every name becomes an alias (listed by /v1/models, answered with).  ValueError names a bad entry."""
+        if block is None:
+            block = {}
+        if not isinstance(block, dict) or not all(isinstance(k, str) and isinstance(v, dict) for k, v in block.items()):
+            raise ValueError(f"alias_sampling={block!r}: expected {{model name: {{sampling fields}}}}")
+        out = {}
+        for name, fields in block.items():
+            name = name.strip()
+            if not name or name == self.model:
+                raise ValueError(f"alias_sampling: {name!r} is empty or the model's own name")
+            out[name] = sampling_defaults_from_config({"sampling": fields})
+        self.alias_sampling = out
+        self.set_aliases([*self.aliases, *(n for n in out if n not in self.aliases)])
 
     def model_names(self) -> list[str]:
         return [self.model, *self.aliases]
@@ -4190,7 +4210,11 @@ class Service:
         `force` (forced_call): the opening of the call the reply must make - see prepare()."""
         # the model card's sampling for this thinking state, then the config's block, then the Chat settings shared with
         # apps; the request's own fields win over all of them
-        defaults = {**model_card_sampling(self.model_arch, thinking), **self.sampling_defaults, **self.shared}
+        # ... then the `alias_sampling` block of the model name the request asked for (the request is its own
+        # sampling dict on the chat endpoints, so the name is in it)
+        asked = (sampling or {}).get("model") if isinstance(sampling, dict) else None
+        defaults = {**model_card_sampling(self.model_arch, thinking), **self.sampling_defaults, **self.shared,
+                    **(self.alias_sampling.get(asked, {}) if isinstance(asked, str) else {})}
         if defaults:                   # the request's own fields win (explicit 0 stays greedy)
             req_values = {k: v for k, v in (sampling or {}).items() if v is not None}
             sampling = {**defaults, **req_values}
@@ -6985,8 +7009,14 @@ def main() -> int:
         svc.set_aliases(cfg.get("aliases"))             # #297: other names the model answers to
     except ValueError as e:
         raise SystemExit(f"[strata] config {e}")
+    try:
+        svc.set_alias_sampling(cfg.get("alias_sampling"))   # sampling defaults per model name (see set_alias_sampling)
+    except (ValueError, SystemExit) as e:
+        raise SystemExit(f"[strata] config {e}")
     if svc.aliases:
         print(f"[strata] model aliases: {', '.join(svc.aliases)}", flush=True)
+    for name, fields in svc.alias_sampling.items():
+        print(f"[strata] model {name}: " + ", ".join(f"{k}={v}" for k, v in fields.items()), flush=True)
     if ("STRATA_API_KEY" in os.environ and not os.environ["STRATA_API_KEY"].strip()) or             any(x == "--api-key" and i + 1 < len(sys.argv) and not sys.argv[i + 1].strip() or x.strip() == "--api-key="
                 for i, x in enumerate(sys.argv)):
         # #213: an empty key would switch authentication off without a word
