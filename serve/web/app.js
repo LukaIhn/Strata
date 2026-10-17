@@ -363,13 +363,17 @@ function facts(el, rows) {
   el.innerHTML = rows.filter((r) => r[1] != null && r[1] !== "").map(([k, v, copy]) =>
     `<dt>${esc(k)}</dt><dd>${copy ? `<code>${esc(v)}</code><button class="st-btn st-btn--icon" data-copy="${esc(v)}" aria-label="Copy">${icon("copy")}</button>` : esc(v)}</dd>`).join("");
 }
-// INFO cvec=project:4-44[:singleL] | add:A-B | 0
+// INFO cvec=project:4-44[:singleL][:block] | add:A-B | 0
 function projectionText(c) {
   if (!c || c === "0" || c === 0) return null;
-  const [mode, range, single] = String(c).split(":");
+  const parts = String(c).split(":");
+  const [mode, range] = parts;
+  const single = parts.find((p, i) => i >= 2 && p.startsWith("single"));
+  const block = parts.includes("block");
   const [a, b] = (range || "").split("-");
   return `${mode === "project" ? "Projection" : "Additive"} control vector on layers ${a}–${b}` +
-         `${single ? ` (layer ${single.replace("single", "")}'s direction)` : ""}. Per chat in Sampling. Its package ` +
+         `${single ? ` (layer ${single.replace("single", "")}'s direction)` : ""}` +
+         `${block ? ", on each block's output" : ""}. Per chat in Sampling. Its package ` +
          "describes the vector as a refusal-direction projection; measure the speed yourself";
 }
 function renderAbout(eng, hw, st) {
